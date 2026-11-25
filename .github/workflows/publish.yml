@@ -1,0 +1,57 @@
+name: Publish Apple silicon release
+on:
+  push:
+    branches: [main]
+    paths: [release-request.age]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: public-macos-release
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and verify signed release artifacts
+        env:
+          REQUEST_KEY: ${{ secrets.BINARY_RELEASE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          sudo apt-get -qq update && sudo apt-get -qq install -y age
+          umask 077
+          identity=$(mktemp)
+          trap 'rm -f "$identity"' EXIT
+          printf '%s\n' "$REQUEST_KEY" > "$identity"
+          request=$(age -d -i "$identity" release-request.age)
+          digest=$(head -n1 <<< "$request")
+          url=$(tail -n1 <<< "$request")
+          [[ "$digest" =~ ^[a-fA-F0-9]{64}$ && "$url" == https://* ]]
+          curl --fail --silent --show-error --proto '=https' --retry 2 "$url" -o "$RUNNER_TEMP/release.zip"
+          echo "$digest  $RUNNER_TEMP/release.zip" | sha256sum --check --status
+          mkdir payload
+          python3 - <<'PY'
+          import os, re, zipfile
+          from pathlib import Path
+          with zipfile.ZipFile(Path(os.environ["RUNNER_TEMP"]) / "release.zip") as archive:
+              names = archive.namelist()
+              dmg, = [n for n in names if re.fullmatch(r"MediaActive-\d+\.\d+\.\d+\.dmg", n)]
+              expected = {dmg, dmg[:-4]+".zip", "appcast.xml"}
+              if set(names) != expected or len(names) != 3:
+                  raise ValueError("Unexpected release contents")
+              archive.extractall("payload")
+          PY
+      - name: Publish installer and update feed together
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dmg=(payload/MediaActive-*.dmg)
+          version=${dmg[0]#payload/MediaActive-}
+          version=${version%.dmg}
+          latest=$(gh release list --limit 100 --json isLatest,tagName --jq '.[]|select(.isLatest)|.tagName')
+          if [[ -n "$latest" ]]; then
+            python3 -c 'import sys; v=lambda s: tuple(map(int,s.lstrip("v").split("."))); sys.exit(0 if v(sys.argv[1]) > v(sys.argv[2]) else 1)' "$version" "$latest"
+          fi
+          gh release create "v$version" --latest --title "MediaActive $version for Apple silicon" \
+            --notes "Download the DMG for a first installation. For an existing Sparkle installation, use Settings → Updates in MediaActive." \
+            "${dmg[0]}" payload/MediaActive-*.zip payload/appcast.xml
