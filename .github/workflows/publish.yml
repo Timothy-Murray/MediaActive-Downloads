@@ -2,8 +2,7 @@ name: Publish Apple silicon release
 on:
   push:
     branches: [main]
-    paths: [release-request.age]
-  workflow_dispatch:
+    paths: [release-build]
 permissions:
   contents: write
 concurrency: public-macos-release
@@ -12,12 +11,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare the publisher
+        run: |
+          sudo apt-get -qq update && sudo apt-get -qq install -y age
+          git config user.name "MediaActive downloads"
+          git config user.email "mediaactive-downloads@users.noreply.github.com"
+          cp release-build publisher-ready
+          git add publisher-ready
+          git commit -m "Accept release request"
+          git push origin HEAD:main
       - name: Fetch and verify signed release artifacts
         env:
           REQUEST_KEY: ${{ secrets.BINARY_RELEASE_DEPLOY_KEY }}
         run: |
           set -euo pipefail
-          sudo apt-get -qq update && sudo apt-get -qq install -y age
+          build=$(cat release-build)
+          for attempt in {1..75}; do
+            git fetch -q origin main
+            if [[ "$(git show FETCH_HEAD:artifact-for 2>/dev/null || true)" == "$build" ]]; then
+              git merge --ff-only FETCH_HEAD
+              break
+            fi
+            sleep 4
+          done
+          test "$(cat artifact-for)" = "$build"
           umask 077
           identity=$(mktemp)
           trap 'rm -f "$identity"' EXIT
@@ -55,3 +72,9 @@ jobs:
           gh release create "v$version" --latest --title "MediaActive $version for Apple silicon" \
             --notes "Download the DMG for a first installation. For an existing Sparkle installation, use Settings → Updates in MediaActive." \
             "${dmg[0]}" payload/MediaActive-*.zip payload/appcast.xml
+      - name: Confirm publication to the private release workflow
+        run: |
+          cp release-build published-build
+          git add published-build
+          git commit -m "Confirm published installer"
+          git push origin HEAD:main
